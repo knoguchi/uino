@@ -1,0 +1,27 @@
+[package]
+name = "uino"
+version = "0.1.0"
+edition = "2021"
+description = "Biologically-inspired sensory processing: predictive coding from periphery to cortex"
+license = "GPL-3.0"
+keywords = ["neuroscience", "sensory", "vision", "predictive-coding"]
+categories = ["science", "simulation"]
+repository = "https://github.com/knoguchi/uino"
+
+[lib]
+name = "uino"
+crate-type = ["rlib"]
+
+[dependencies]
+rand = "0.8"
+rand_distr = "0.4"
+rustfft = "6.2"
+rayon = "1.11"
+image = "0.25"
+
+[dev-dependencies]
+approx = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
