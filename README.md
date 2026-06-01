@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" width="160" alt="Uino logo">
+</p>
+
 # Uino (初乃)
 
 Biologically-inspired sensory processing in Rust. Early stage — being redesigned around predictive coding.

@@ -1,0 +1,39 @@
+<svg viewBox="11 7 320 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="brain" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FBEFC4"/>
+      <stop offset="1" stop-color="#F4DC92"/>
+    </linearGradient>
+  </defs>
+
+  <!-- brain body (side profile, soft lobes) -->
+  <path d="M150 70
+           C100 62 66 92 70 132
+           C44 142 42 178 66 192
+           C58 224 88 248 124 244
+           C150 270 200 270 224 248
+           C262 250 290 224 282 188
+           C300 174 296 142 272 136
+           C272 96 238 66 196 72
+           C184 64 162 64 150 70 Z"
+        fill="url(#brain)" stroke="#D9B23C" stroke-width="5" stroke-linejoin="round"/>
+
+  <!-- a few soft wrinkles -->
+  <path d="M250 110 C268 124 270 150 256 166" fill="none" stroke="#D9B23C" stroke-width="4" stroke-linecap="round" opacity="0.8"/>
+  <path d="M232 200 C252 206 262 224 254 240" fill="none" stroke="#D9B23C" stroke-width="4" stroke-linecap="round" opacity="0.8"/>
+  <path d="M120 210 C140 218 150 234 144 246" fill="none" stroke="#D9B23C" stroke-width="4" stroke-linecap="round" opacity="0.7"/>
+  <!-- upper gyri -->
+  <path d="M118 108 C104 118 100 134 110 146" fill="none" stroke="#D9B23C" stroke-width="4" stroke-linecap="round" opacity="0.75"/>
+  <path d="M150 92 C140 100 138 114 148 122" fill="none" stroke="#D9B23C" stroke-width="4" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- blush -->
+  <ellipse cx="108" cy="178" rx="22" ry="13" fill="#F3A86B" opacity="0.7"/>
+  <ellipse cx="250" cy="178" rx="22" ry="13" fill="#F3A86B" opacity="0.7"/>
+
+  <!-- eyes -->
+  <circle cx="146" cy="150" r="11" fill="#6B5413"/>
+  <circle cx="214" cy="150" r="11" fill="#6B5413"/>
+
+  <!-- smile -->
+  <path d="M162 176 C176 192 196 192 210 176" fill="none" stroke="#6B5413" stroke-width="6" stroke-linecap="round"/>
+</svg>
