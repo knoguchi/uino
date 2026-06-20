@@ -6,8 +6,10 @@
 //! visual input.
 
 pub mod cortex;
+pub mod microcircuit;
 
 pub use cortex::{
     A1Core, Belt, CorticalConfig, CorticalModel, CorticalModelBuilder, CorticalOutput,
     RewardModule, STRF, ThalamicRelay, ThetaGammaOscillator,
 };
+pub use microcircuit::{AdEx, AdExParams, AmpaSynapse, HebbianCa, HebbianParams, NmdaSynapse, SynapseParams};
