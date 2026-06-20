@@ -6,11 +6,13 @@
 //! - Local Hebbian Ca²⁺-proxy plasticity with L1 weight decay
 
 pub mod adex;
+pub mod apparent_motion;
 pub mod canonical;
 pub mod plasticity;
 pub mod synapse;
 
 pub use adex::{AdEx, AdExParams};
+pub use apparent_motion::{alternating_stimulus, ApparentMotion, TwoUnitOutput};
 pub use canonical::{Microcircuit, MicrocircuitParams, StepOutput};
 pub use plasticity::{HebbianCa, HebbianParams};
 pub use synapse::{AmpaSynapse, NmdaSynapse, SynapseParams};

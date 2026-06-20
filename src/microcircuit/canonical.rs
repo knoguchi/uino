@@ -100,9 +100,18 @@ impl Microcircuit {
 
     /// Advance one timestep with bottom-up input `s`.
     pub fn step(&mut self, s: f64, dt_ms: f64) -> StepOutput {
-        // Net drives per population (positive depolarizing, matching AdEx convention).
-        let drive_plus = self.params.beta * s - self.params.gamma * self.mu_hat;
-        let drive_minus = self.params.gamma * self.mu_hat - self.params.beta * s;
+        self.step_with_top_down(s, 0.0, dt_ms)
+    }
+
+    /// Advance one timestep with both bottom-up input `s` and an externally
+    /// supplied top-down prediction `top_down`. The effective prediction is
+    /// the sum of this unit's internal `mu_hat` and the external signal —
+    /// allowing a higher-level controller (e.g. a multi-unit predictive
+    /// hierarchy) to inject prediction biases without overwriting state.
+    pub fn step_with_top_down(&mut self, s: f64, top_down: f64, dt_ms: f64) -> StepOutput {
+        let effective_mu = self.mu_hat + top_down;
+        let drive_plus = self.params.beta * s - self.params.gamma * effective_mu;
+        let drive_minus = self.params.gamma * effective_mu - self.params.beta * s;
 
         let mut pe_plus_spikes = 0usize;
         let mut pe_minus_spikes = 0usize;
