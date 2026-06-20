@@ -23,39 +23,28 @@ pub struct MicrocircuitParams {
     pub beta: f64,
     /// Top-down gain: pA of drive per unit of `μ̂`.
     pub gamma: f64,
-    /// PC learning rate (per spike-count difference).
+    /// Prediction integration rate per PE spike-count difference. The
+    /// cell's prediction `μ̂` follows its input with an effective low-pass
+    /// time constant set by this rate and the PE firing-rate gain. Larger
+    /// `eta` → faster tracking, picks up higher input frequencies. Smaller
+    /// `eta` → slower tracking, only follows slow input components.
+    ///
+    /// This is the per-cell timescale that produces multi-timescale
+    /// behavior across a stack: lower stages use larger `eta` to follow
+    /// fast input; higher stages use smaller `eta` to extract slow
+    /// features. No mode switch — the same PC mechanism at different speeds.
     pub eta: f64,
-    /// SFA time constant (ms). The slow trace `s_slow` exponentially tracks
-    /// input with this time constant; signals faster than ~1/tau_sfa cycle
-    /// are filtered out. Predicts only the slow component.
-    pub tau_sfa_ms: f64,
-    /// SFA pull strength per ms: fraction of (s_slow − μ̂) added to μ̂ each
-    /// step. Anchors the prediction to the slow trace.
-    pub sfa_pull: f64,
     /// AdEx parameters for PE neurons.
     pub neuron: AdExParams,
 }
 
 impl Default for MicrocircuitParams {
     fn default() -> Self {
-        // PE neurons use the fast-spiking profile so they keep firing under
-        // sustained mismatch until prediction catches up. Regular-spiking
-        // adaptation would silence them before inference converges.
-        //
-        // β/γ chosen so the rheobase deadzone (~600 pA) is small relative to
-        // typical unit-scale inputs: at β=2000, an `s − μ̂` of ~0.3 already
-        // crosses threshold. Inference converges to μ̂ ≈ s within ~0.3.
-        //
-        // tau_sfa_ms ≈ 200 ms cleanly separates 50 Hz noise (filtered) from
-        // 1 Hz signal (tracked). sfa_pull = 0.005 / ms gives ~τ = 200 ms
-        // effective μ̂ relaxation toward s_slow.
         Self {
             n_per_population: 16,
             beta: 2000.0,
             gamma: 2000.0,
             eta: 0.0005,
-            tau_sfa_ms: 80.0,
-            sfa_pull: 0.005,
             neuron: AdExParams::fast_spiking(),
         }
     }
@@ -69,14 +58,8 @@ pub struct Microcircuit {
     pub pe_minus: Vec<AdEx>,
     /// Current prediction estimate.
     pub mu_hat: f64,
-    /// Slow trace of the bottom-up input (SFA component). Tracks the slow
-    /// envelope of `s` with time constant `tau_sfa_ms`.
-    pub s_slow: f64,
     /// Whether prediction updates from PE activity (Principle B coupling).
     pub coupling: bool,
-    /// Whether the slow trace anchors μ̂ (SFA). With this off but `coupling`
-    /// on, only PC drives μ̂ — the falsification control for SFA.
-    pub sfa_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -94,13 +77,7 @@ impl Microcircuit {
             pe_plus,
             pe_minus,
             mu_hat: 0.0,
-            s_slow: 0.0,
             coupling: true,
-            // SFA disabled by default. Multi-stage learning uses PC, which
-            // needs sustained PE signal to propagate up; SFA silences PE
-            // too quickly for that. Enable per-cell when SFA-driven slow
-            // tracking is what you want (Phase 1b).
-            sfa_enabled: false,
         }
     }
 
@@ -116,7 +93,6 @@ impl Microcircuit {
             n.reset();
         }
         self.mu_hat = 0.0;
-        self.s_slow = 0.0;
     }
 
     /// Disable the prediction → input coupling. Used as the falsification
@@ -128,16 +104,6 @@ impl Microcircuit {
 
     pub fn enable_coupling(&mut self) {
         self.coupling = true;
-    }
-
-    /// Disable SFA (the slow-trace anchor on μ̂). PC still runs.
-    /// Falsification control for SFA-dependent behavior.
-    pub fn disable_sfa(&mut self) {
-        self.sfa_enabled = false;
-    }
-
-    pub fn enable_sfa(&mut self) {
-        self.sfa_enabled = true;
     }
 
     /// Advance one timestep with bottom-up input `s`.
@@ -169,25 +135,9 @@ impl Microcircuit {
             }
         }
 
-        // SFA: update slow trace of input.
-        let alpha_sfa = dt_ms / (self.params.tau_sfa_ms + dt_ms);
-        self.s_slow = (1.0 - alpha_sfa) * self.s_slow + alpha_sfa * s;
-
         if self.coupling {
-            if self.sfa_enabled {
-                // SFA mode: μ̂ tracks the slow trace of the input. Required
-                // for representing time-varying slow signals (Phase 1b
-                // mechanism). PE update is suppressed in this mode because
-                // it pulls μ̂ toward the stationary mean and fights the
-                // time-varying slow target.
-                self.mu_hat = self.s_slow;
-            } else {
-                // PC mode (default): μ̂ moves with PE imbalance. Converges
-                // to the mean of `s`. Used by multi-stage learning where
-                // sustained PE signal must propagate upward.
-                let diff = pe_plus_spikes as f64 - pe_minus_spikes as f64;
-                self.mu_hat += self.params.eta * diff;
-            }
+            let diff = pe_plus_spikes as f64 - pe_minus_spikes as f64;
+            self.mu_hat += self.params.eta * diff;
         }
 
         StepOutput { pe_plus_spikes, pe_minus_spikes }
@@ -340,47 +290,46 @@ mod tests {
         }
     }
 
-    /// SFA function test (Phase 1b). With SFA enabled, the cell's
-    /// prediction μ̂ should track the slow component of a mixed slow+fast
-    /// input, not the fast component. Verifies the slow-trace mechanism
-    /// the Phase 2b invariance claim depends on.
-    #[test]
-    fn mu_hat_tracks_slow_component_ignoring_fast() {
+    fn run_mixed_input(mc: &mut Microcircuit, n_steps: usize, dt_ms: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         use std::f64::consts::PI;
-
-        let mut mc = Microcircuit::with_defaults();
-        mc.enable_sfa();
-        let dt_ms = 0.1;
-        let n_steps = 60_000; // 6 seconds
-        let slow_period_ms = 1000.0; // 1 Hz
-        let fast_period_ms = 20.0; // 50 Hz
-
-        let mut mu_history = Vec::with_capacity(n_steps);
-        let mut slow_history = Vec::with_capacity(n_steps);
-        let mut fast_history = Vec::with_capacity(n_steps);
-
+        const SLOW_PERIOD_MS: f64 = 1000.0; // 1 Hz
+        const FAST_PERIOD_MS: f64 = 20.0; // 50 Hz
+        let mut mu = Vec::with_capacity(n_steps);
+        let mut slow = Vec::with_capacity(n_steps);
+        let mut fast = Vec::with_capacity(n_steps);
         for k in 0..n_steps {
             let t_ms = k as f64 * dt_ms;
-            let slow = 2.0 + 0.8 * (2.0 * PI * t_ms / slow_period_ms).sin();
-            let fast = 0.5 * (2.0 * PI * t_ms / fast_period_ms).sin();
-            mc.step(slow + fast, dt_ms);
-            mu_history.push(mc.mu_hat);
-            slow_history.push(slow);
-            fast_history.push(fast);
+            let s_slow = 2.0 + 0.8 * (2.0 * PI * t_ms / SLOW_PERIOD_MS).sin();
+            let s_fast = 0.5 * (2.0 * PI * t_ms / FAST_PERIOD_MS).sin();
+            mc.step(s_slow + s_fast, dt_ms);
+            mu.push(mc.mu_hat);
+            slow.push(s_slow);
+            fast.push(s_fast);
         }
+        (mu, slow, fast)
+    }
 
-        // Discard transient (first 1/3) and measure correlations on the rest.
-        let start = n_steps / 3;
-        let mu_late = &mu_history[start..];
-        let slow_late = &slow_history[start..];
-        let fast_late = &fast_history[start..];
+    /// Phase 1b: multi-timescale predictive coding. The cell's effective
+    /// low-pass cutoff is set by `eta` × PE-gain. A cell with the right
+    /// `eta` selectively tracks the slow component of a mixed slow+fast
+    /// input — picks up the 1 Hz signal and filters out the 50 Hz noise.
+    ///
+    /// No mode switch: this is the same PC mechanism, just tuned. Higher
+    /// cortical stages would use smaller `eta` (longer effective tau) to
+    /// extract slower features.
+    #[test]
+    fn cell_with_slow_eta_tracks_slow_component_ignoring_fast() {
+        let params = MicrocircuitParams { eta: 0.03, ..Default::default() };
+        let mut mc = Microcircuit::new(params);
+        let (mu, slow, fast) = run_mixed_input(&mut mc, 60_000, 0.1);
+        let start = mu.len() / 3;
 
-        let corr_slow = correlation(mu_late, slow_late);
-        let corr_fast = correlation(mu_late, fast_late);
+        let corr_slow = correlation(&mu[start..], &slow[start..]);
+        let corr_fast = correlation(&mu[start..], &fast[start..]);
 
         assert!(
             corr_slow > 0.5,
-            "μ̂ should correlate with slow component: corr={}",
+            "μ̂ should track slow component: corr={}",
             corr_slow
         );
         assert!(
@@ -391,37 +340,21 @@ mod tests {
         );
     }
 
-    /// Falsification control for SFA: with the slow-trace mechanism disabled,
-    /// PC alone cannot track time-varying slow signals — it converges to the
-    /// mean and stays there. Correlation with slow component should be far
-    /// below the SFA-on value.
+    /// Falsification: a cell with `eta` too small has an effective cutoff
+    /// well below 1 Hz, so it can't track the slow oscillation either —
+    /// μ̂ stays near the stationary mean and barely correlates with the
+    /// slow signal. This confirms that selective tracking is a property
+    /// of the integration timescale, not magic.
     #[test]
-    fn pc_alone_cannot_track_slow_oscillation() {
-        use std::f64::consts::PI;
-
-        let mut mc = Microcircuit::with_defaults();
-        // SFA is off by default; explicit for clarity.
-        mc.disable_sfa();
-        let dt_ms = 0.1;
-        let n_steps = 60_000;
-        let slow_period_ms = 1000.0;
-        let fast_period_ms = 20.0;
-
-        let mut mu_history = Vec::with_capacity(n_steps);
-        let mut slow_history = Vec::with_capacity(n_steps);
-        for k in 0..n_steps {
-            let t_ms = k as f64 * dt_ms;
-            let slow = 2.0 + 0.8 * (2.0 * PI * t_ms / slow_period_ms).sin();
-            let fast = 0.5 * (2.0 * PI * t_ms / fast_period_ms).sin();
-            mc.step(slow + fast, dt_ms);
-            mu_history.push(mc.mu_hat);
-            slow_history.push(slow);
-        }
-        let start = n_steps / 3;
-        let corr = correlation(&mu_history[start..], &slow_history[start..]);
+    fn cell_with_tiny_eta_fails_to_track_slow() {
+        let params = MicrocircuitParams { eta: 0.00005, ..Default::default() };
+        let mut mc = Microcircuit::new(params);
+        let (mu, slow, _fast) = run_mixed_input(&mut mc, 60_000, 0.1);
+        let start = mu.len() / 3;
+        let corr = correlation(&mu[start..], &slow[start..]);
         assert!(
             corr.abs() < 0.4,
-            "without SFA, μ̂ should NOT track slow oscillation: corr={}",
+            "tiny-eta cell should fail to track slow: corr={}",
             corr,
         );
     }
