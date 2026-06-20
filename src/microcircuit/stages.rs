@@ -92,6 +92,20 @@ pub struct MultiStage {
     /// `input[idx_for_rf(cell_idx, rf_offset)]` into that cell's `s`.
     /// `None` falls back to direct 1:1 input mapping (legacy behavior).
     pub input_rf: Option<InputRf>,
+
+    /// Bottom-stage lateral inhibition. Each cell's effective input is
+    /// divided by `1 + strength * Σ neighbor_inputs` over a square of
+    /// `radius` cells around it. Forces cells to compete: only those
+    /// receiving stronger input than their neighbors get to drive their
+    /// PE populations. The mechanism that makes Hebbian learning produce
+    /// specialized feature detectors instead of redundant copies.
+    pub lateral_inhibition: Option<LateralInhibition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LateralInhibition {
+    pub radius: usize,
+    pub strength: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -174,7 +188,48 @@ impl MultiStage {
             ff_weights,
             plasticity_enabled: false,
             input_rf: None,
+            lateral_inhibition: None,
         }
+    }
+
+    /// Enable lateral inhibition at the bottom stage. `radius` is the
+    /// neighborhood size in cells; `strength` controls how much neighbors'
+    /// activity suppresses a cell's input. Try strength = 0.1–0.5.
+    pub fn enable_lateral_inhibition(&mut self, radius: usize, strength: f64) {
+        self.lateral_inhibition = Some(LateralInhibition { radius, strength });
+    }
+
+    /// Apply divisive normalization across the bottom-stage cell grid.
+    fn apply_lateral_inhibition(&self, mut input: Vec<f64>) -> Vec<f64> {
+        let Some(li) = &self.lateral_inhibition else {
+            return input;
+        };
+        let cells_x = self.stages[0].cells_x;
+        let cells_y = self.stages[0].cells_y;
+        let r = li.radius as i32;
+        let modulated: Vec<f64> = (0..input.len())
+            .map(|idx| {
+                let cx = (idx % cells_x) as i32;
+                let cy = (idx / cells_x) as i32;
+                let mut neighbor_sum = 0.0;
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nx = cx + dx;
+                        let ny = cy + dy;
+                        if nx >= 0 && (nx as usize) < cells_x && ny >= 0 && (ny as usize) < cells_y {
+                            neighbor_sum +=
+                                input[ny as usize * cells_x + nx as usize].max(0.0);
+                        }
+                    }
+                }
+                input[idx] / (1.0 + li.strength * neighbor_sum)
+            })
+            .collect();
+        input = modulated;
+        input
     }
 
     pub fn enable_plasticity(&mut self) {
@@ -379,7 +434,8 @@ impl MultiStage {
         let mut pe_minus: Vec<Vec<usize>> = vec![Vec::new(); n_stages];
 
         // Walk bottom to top.
-        let mut current_input: Vec<f64> = self.project_input(input);
+        let projected = self.project_input(input);
+        let mut current_input: Vec<f64> = self.apply_lateral_inhibition(projected);
         for i in 0..n_stages {
             let n_cells = self.stages[i].units.len();
             let top_down: Vec<f64> = if i + 1 < n_stages {

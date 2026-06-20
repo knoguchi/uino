@@ -212,9 +212,14 @@ fn main() -> Result<(), String> {
     let mut cortex = MultiStage::with_defaults(&[(CELLS, CELLS), (CELLS / 2, CELLS / 2)], &[2]);
     cortex.enable_plasticity();
     cortex.enable_input_rf(3, CELLS, CELLS);
+    // Lateral inhibition disabled for this run — was making things worse,
+    // probably needs different placement (post-PE rather than on input).
     let n_top = cortex.stages[cortex.stages.len() - 1].units.len();
 
-    println!("Architecture: retinula({c}×{c}) → cortex {c}→{m} (3×3 plastic input RFs, top={t})", c = CELLS, m = CELLS / 2, t = n_top);
+    println!(
+        "Architecture: retinula({c}×{c}) → cortex {c}→{m} (3×3 plastic input RFs, top={t})",
+        c = CELLS, m = CELLS / 2, t = n_top,
+    );
     println!("{} training images, {} test images, {} classes", train_imgs.len(), test_imgs.len(), N_CLASSES);
     println!("Chance accuracy = {:.1}%\n", 100.0 / N_CLASSES as f64);
 
