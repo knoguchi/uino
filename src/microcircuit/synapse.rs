@@ -12,7 +12,9 @@
 //! Time constants: AMPA τ ≈ 5 ms, NMDA τ ≈ 50 ms (decay).
 
 /// Shared parameter shape for both AMPA and NMDA channels.
-#[derive(Clone, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SynapseParams {
     /// Decay time constant (ms).
     pub tau: f64,
@@ -31,7 +33,7 @@ impl SynapseParams {
 }
 
 /// AMPA receptor channel (fast, linear).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AmpaSynapse {
     pub params: SynapseParams,
     /// Aggregate conductance (nS).
@@ -83,7 +85,7 @@ impl Default for AmpaSynapse {
 }
 
 /// NMDA receptor channel (slow, voltage-dependent Mg²⁺ block).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NmdaSynapse {
     pub params: SynapseParams,
     /// Aggregate conductance (nS).

@@ -15,9 +15,12 @@ crate-type = ["rlib"]
 [dependencies]
 cochlea-rs = "1.1"
 retinula = "0.1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
 
 [dev-dependencies]
 approx = "0.5"
+tempfile = "3"
 
 [profile.release]
 lto = true

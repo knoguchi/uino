@@ -8,8 +8,10 @@
 //!
 //!   on V >= V_peak:   spike; V := V_reset; w += b; refractory for t_ref
 
+use serde::{Deserialize, Serialize};
+
 /// AdEx parameters. Defaults from Brette & Gerstner 2005 regular-spiking cortical fit.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdExParams {
     /// Membrane capacitance (pF).
     pub c: f64,
@@ -83,7 +85,7 @@ impl AdExParams {
 }
 
 /// AdEx neuron state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdEx {
     pub params: AdExParams,
     /// Membrane voltage (mV).

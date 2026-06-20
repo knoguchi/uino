@@ -13,7 +13,9 @@
 //! used in Frontiers SNN-PC 2024; pre-before-post produces LTP and
 //! post-before-pre produces LTD via the asymmetric trace ordering.
 
-#[derive(Clone, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HebbianParams {
     /// Presynaptic trace time constant (ms).
     pub tau_pre: f64,
@@ -46,7 +48,7 @@ impl Default for HebbianParams {
 }
 
 /// A single plastic connection: weight + spike traces + parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HebbianCa {
     pub params: HebbianParams,
     pub w: f64,

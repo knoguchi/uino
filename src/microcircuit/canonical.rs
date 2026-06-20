@@ -12,10 +12,12 @@
 //! PE populations grow quiet — the compass metric "PE spikes per inference"
 //! falls.
 
+use serde::{Deserialize, Serialize};
+
 use crate::microcircuit::adex::{AdEx, AdExParams};
 
 /// Parameters for one canonical microcircuit unit.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MicrocircuitParams {
     /// Number of neurons in each of PE+ and PE−.
     pub n_per_population: usize,
@@ -51,7 +53,7 @@ impl Default for MicrocircuitParams {
 }
 
 /// One canonical predictive-coding microcircuit.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Microcircuit {
     pub params: MicrocircuitParams,
     pub pe_plus: Vec<AdEx>,
@@ -62,7 +64,7 @@ pub struct Microcircuit {
     pub coupling: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StepOutput {
     pub pe_plus_spikes: usize,
     pub pe_minus_spikes: usize,

@@ -10,9 +10,12 @@
 //! drives activity through the spatially-corresponding cell at every stage
 //! up the stack, never the spatial mirror.
 
-use crate::microcircuit::canonical::{Microcircuit, MicrocircuitParams};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
+use crate::microcircuit::canonical::{Microcircuit, MicrocircuitParams};
+use crate::microcircuit::plasticity::{HebbianCa, HebbianParams};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StageGrid {
     pub cells_x: usize,
     pub cells_y: usize,
@@ -57,20 +60,30 @@ impl StageGrid {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MultiStage {
     pub stages: Vec<StageGrid>,
     /// Pool factor between stage[i] and stage[i+1]. Length = stages.len() - 1.
     pub pools: Vec<usize>,
-    /// Feedforward divisor: pooled PE+ spike count divided by this to feed
-    /// the next stage's scalar input.
+    /// Feedforward divisor: weighted PE+ contribution divided by this to
+    /// match historical scaling.
     pub ff_gain: f64,
     /// Feedback gain applied to higher stage's μ̂ before injecting as
     /// top-down to the lower stage's receptive-field cells.
     pub fb_gain: f64,
+    /// Plastic per-connection feedforward weights. `ff_weights[stage_pair]`
+    /// has one [`HebbianCa`] per lower-stage cell (giving its weight to
+    /// its single parent cell in the next stage). Length = stages.len() − 1.
+    /// Weights start at 1.0 (uniform routing); Hebbian-Ca updates strengthen
+    /// connections whose child→parent PE+ activity coincides.
+    pub ff_weights: Vec<Vec<HebbianCa>>,
+    /// Master switch for Hebbian updates on feedforward weights. Off by
+    /// default so existing tests with synthetic patterns run with stable
+    /// uniform routing. Enable to learn pattern-selective connections.
+    pub plasticity_enabled: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MultiStageStepOutput {
     /// Per-stage PE+ counts (outer index = stage, bottom to top).
     pub pe_plus: Vec<Vec<usize>>,
@@ -111,7 +124,59 @@ impl MultiStage {
             .iter()
             .map(|&(x, y)| StageGrid::new(x, y, params.clone()))
             .collect();
-        Self { stages, pools: pools.to_vec(), ff_gain: 0.3, fb_gain: 1.0 }
+        // One Hebbian-Ca per lower-stage cell, giving its weight to its
+        // single parent cell. Slow learning rates by default so weights
+        // are nearly static unless plasticity_enabled is on for many steps.
+        let hebbian_params = HebbianParams {
+            tau_pre: 20.0,
+            tau_post: 20.0,
+            eta_ltp: 5e-4,
+            eta_ltd: 5e-4,
+            lambda_l1: 1e-6,
+            w_min: 0.0,
+            w_max: 5.0,
+        };
+        let ff_weights: Vec<Vec<HebbianCa>> = (0..stages.len().saturating_sub(1))
+            .map(|i| (0..stages[i].units.len()).map(|_| HebbianCa::new(hebbian_params.clone(), 1.0)).collect())
+            .collect();
+        Self {
+            stages,
+            pools: pools.to_vec(),
+            ff_gain: 0.3,
+            fb_gain: 1.0,
+            ff_weights,
+            plasticity_enabled: false,
+        }
+    }
+
+    pub fn enable_plasticity(&mut self) {
+        self.plasticity_enabled = true;
+    }
+
+    pub fn disable_plasticity(&mut self) {
+        self.plasticity_enabled = false;
+    }
+
+    /// Serialize the entire model state (weights + per-cell state) to a
+    /// bincode-encoded byte vector. Round-trips through [`Self::load`].
+    pub fn save(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("MultiStage serialize")
+    }
+
+    /// Deserialize from bytes produced by [`Self::save`].
+    pub fn load(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+
+    /// Save the model to a file (bincode binary).
+    pub fn save_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        std::fs::write(path, self.save())
+    }
+
+    /// Load a model from a file written by [`Self::save_to_file`].
+    pub fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        Self::load(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     pub fn with_defaults(shapes: &[(usize, usize)], pools: &[usize]) -> Self {
@@ -176,21 +241,57 @@ impl MultiStage {
 
             let (pp, pm) = self.stages[i].step(&current_input, &top_down, dt_ms);
 
-            // Build next stage's input from pooled PE+ of this stage.
+            // Build next stage's input from PLASTIC-WEIGHTED PE+ of this stage.
             if i + 1 < n_stages {
                 let n_up = self.stages[i + 1].units.len();
                 let mut pooled = vec![0.0f64; n_up];
                 for (child_i, &pp_count) in pp.iter().enumerate() {
-                    pooled[self.parent_idx(i, child_i)] += pp_count as f64;
+                    let parent_i = self.parent_idx(i, child_i);
+                    let w = self.ff_weights[i][child_i].w;
+                    pooled[parent_i] += w * pp_count as f64;
                 }
                 for v in &mut pooled {
                     *v /= self.ff_gain;
                 }
+
+                // Pre-spikes: register each lower PE+ event on its outgoing
+                // Hebbian connection. Plasticity update on the weight happens
+                // here (uses recent post-trace for LTD term).
+                if self.plasticity_enabled {
+                    for (child_i, &pp_count) in pp.iter().enumerate() {
+                        for _ in 0..pp_count {
+                            self.ff_weights[i][child_i].pre_spike();
+                        }
+                    }
+                }
+
                 current_input = pooled;
             }
 
             pe_plus[i] = pp;
             pe_minus[i] = pm;
+        }
+
+        // Post-spikes: walk the stage pairs, register each parent's PE+ on
+        // all its children's outgoing connections. LTP term uses each
+        // child's pre-trace from earlier in this step.
+        if self.plasticity_enabled {
+            for stage_pair in 0..self.stages.len().saturating_sub(1) {
+                let n_low = self.stages[stage_pair].units.len();
+                for child_i in 0..n_low {
+                    let parent_i = self.parent_idx(stage_pair, child_i);
+                    let parent_pp = pe_plus[stage_pair + 1][parent_i];
+                    for _ in 0..parent_pp {
+                        self.ff_weights[stage_pair][child_i].post_spike();
+                    }
+                }
+            }
+            // Decay traces and apply L1 weight decay.
+            for stage_weights in &mut self.ff_weights {
+                for w in stage_weights {
+                    w.step(dt_ms);
+                }
+            }
         }
 
         MultiStageStepOutput { pe_plus, pe_minus }
@@ -587,6 +688,77 @@ mod tests {
             "timescale gradient should outperform flat profile: gradient={}, flat={}",
             gradient,
             flat,
+        );
+    }
+
+    /// Save/load round-trip preserves learned weights and per-cell state.
+    /// Demonstrates that "memorization" via Hebbian-learned weights persists
+    /// across save/load — once the network learns, the knowledge can be
+    /// frozen to disk and restored.
+    #[test]
+    fn save_load_round_trip_preserves_state() {
+        let mut ms = MultiStage::with_defaults(&[(4, 4), (2, 2)], &[2]);
+        ms.enable_plasticity();
+        let input = one_hot(4, 4, 1, 1, 2.0);
+        run_steady(&mut ms, &input, 20_000);
+
+        let trained_w = ms.ff_weights[0][1 * 4 + 1].w;
+        let trained_mu: Vec<f64> = ms.stages[1].predictions();
+
+        // Round-trip through bytes.
+        let bytes = ms.save();
+        let restored = MultiStage::load(&bytes).expect("deserialize");
+        assert_eq!(restored.ff_weights[0][1 * 4 + 1].w, trained_w);
+        assert_eq!(restored.stages[1].predictions(), trained_mu);
+    }
+
+    /// File round-trip works the same way.
+    #[test]
+    fn save_load_via_file() {
+        let mut ms = MultiStage::with_defaults(&[(4, 4), (2, 2)], &[2]);
+        ms.enable_plasticity();
+        let input = one_hot(4, 4, 2, 2, 2.0);
+        run_steady(&mut ms, &input, 10_000);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        ms.save_to_file(tmp.path()).expect("save");
+        let restored = MultiStage::load_from_file(tmp.path()).expect("load");
+        assert_eq!(
+            restored.ff_weights[0][2 * 4 + 2].w,
+            ms.ff_weights[0][2 * 4 + 2].w
+        );
+    }
+
+    /// With plasticity on, connections whose child→parent PE+ activity
+    /// frequently coincides get strengthened. Drive a single hot lower
+    /// cell for many steps; its outgoing connection grows above baseline,
+    /// while connections from quiet cells stay near baseline.
+    #[test]
+    fn feedforward_weights_strengthen_on_active_connections() {
+        let mut ms = MultiStage::with_defaults(&[(4, 4), (2, 2)], &[2]);
+        ms.enable_plasticity();
+        let input = one_hot(4, 4, 1, 1, 2.0);
+
+        let initial_active = ms.ff_weights[0][1 * 4 + 1].w;
+        let initial_quiet = ms.ff_weights[0][3 * 4 + 3].w;
+        assert_eq!(initial_active, 1.0);
+        assert_eq!(initial_quiet, 1.0);
+
+        run_steady(&mut ms, &input, 30_000);
+
+        let final_active = ms.ff_weights[0][1 * 4 + 1].w;
+        let final_quiet = ms.ff_weights[0][3 * 4 + 3].w;
+        assert!(
+            final_active > 1.05,
+            "active connection should strengthen, got {} → {}",
+            initial_active,
+            final_active,
+        );
+        assert!(
+            final_active > final_quiet + 0.05,
+            "active connection should out-grow quiet one: active={}, quiet={}",
+            final_active,
+            final_quiet,
         );
     }
 
