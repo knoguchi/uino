@@ -169,11 +169,43 @@ impl TwoStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::separability;
 
     fn one_hot(cells_x: usize, cells_y: usize, x: usize, y: usize, mag: f64) -> Vec<f64> {
         let mut v = vec![0.0; cells_x * cells_y];
         v[y * cells_x + x] = mag;
         v
+    }
+
+    /// Two-hot pattern: bright at the two diagonal corners of a 4×4.
+    fn diagonal_pattern(mag: f64) -> Vec<f64> {
+        let mut v = vec![0.0; 16];
+        v[0] = mag;
+        v[3 * 4 + 3] = mag;
+        v
+    }
+
+    /// Two-hot pattern: bright at the two anti-diagonal corners of a 4×4.
+    fn anti_diagonal_pattern(mag: f64) -> Vec<f64> {
+        let mut v = vec![0.0; 16];
+        v[3] = mag;
+        v[3 * 4] = mag;
+        v
+    }
+
+    /// Present `pattern` to `ts` for `n_steps`, return upper-stage signed
+    /// activity per cell (PE+ − PE−) summed over the presentation window.
+    /// This is the "class representation" used for separability scoring.
+    fn collect_upper_signature(ts: &mut TwoStage, pattern: &[f64], n_steps: usize) -> Vec<f64> {
+        let n_up = ts.upper.units.len();
+        let mut sig = vec![0.0; n_up];
+        for _ in 0..n_steps {
+            let out = ts.step(pattern, 0.1);
+            for i in 0..n_up {
+                sig[i] += out.upper_pe_plus[i] as f64 - out.upper_pe_minus[i] as f64;
+            }
+        }
+        sig
     }
 
     fn run_steady(ts: &mut TwoStage, input: &[f64], n_steps: usize) {
@@ -294,5 +326,112 @@ mod tests {
                 target,
             );
         }
+    }
+
+    /// Train on alternating exposures of two distinct spatial patterns
+    /// (diagonal vs anti-diagonal hot spots). After training, present
+    /// multiple held-out samples of each class and verify the upper-stage
+    /// activity signatures cluster separately — manifold separability index
+    /// exceeds 1 by a clear margin.
+    #[test]
+    fn upper_stage_discriminates_two_classes() {
+        let mut ts = TwoStage::with_defaults(4, 4, 2);
+
+        // Train: interleave the two patterns with mild magnitude jitter
+        // so the system sees varied examples per class.
+        let presentation_steps = 200;
+        let n_cycles = 50;
+        for cycle in 0..n_cycles {
+            let mag_a = 1.8 + 0.4 * ((cycle * 7) % 5) as f64 / 5.0;
+            let mag_b = 1.8 + 0.4 * ((cycle * 11) % 5) as f64 / 5.0;
+            for _ in 0..presentation_steps {
+                ts.step(&diagonal_pattern(mag_a), 0.1);
+            }
+            for _ in 0..presentation_steps {
+                ts.step(&anti_diagonal_pattern(mag_b), 0.1);
+            }
+        }
+
+        // Collect class signatures from held-out magnitudes.
+        let test_mags = [1.85, 1.95, 2.05, 2.15];
+        let class_a: Vec<Vec<f64>> = test_mags
+            .iter()
+            .map(|&m| collect_upper_signature(&mut ts, &diagonal_pattern(m), 500))
+            .collect();
+        let class_b: Vec<Vec<f64>> = test_mags
+            .iter()
+            .map(|&m| collect_upper_signature(&mut ts, &anti_diagonal_pattern(m), 500))
+            .collect();
+
+        let sep = separability(&class_a, &class_b).expect("separability must compute");
+        assert!(
+            sep.index > 2.0,
+            "expected class separability > 2, got {} (radius {}, centroid dist {})",
+            sep.index,
+            sep.mean_radius,
+            sep.centroid_distance,
+        );
+    }
+
+    /// The compass-metric claim: with coupling, the system achieves class
+    /// discrimination at lower PE energy than without coupling. Same
+    /// information, fewer spikes — the "low-power AI" promise of predictive
+    /// coding. Both conditions remain separable; coupling adds efficiency.
+    #[test]
+    fn coupling_reduces_pe_energy_at_comparable_separability() {
+        let train_and_probe = |coupling: bool| -> (f64, usize) {
+            let mut ts = TwoStage::with_defaults(4, 4, 2);
+            if !coupling {
+                ts.disable_coupling();
+            }
+            let presentation_steps = 200;
+            for cycle in 0..50 {
+                let mag_a = 1.8 + 0.4 * ((cycle * 7) % 5) as f64 / 5.0;
+                let mag_b = 1.8 + 0.4 * ((cycle * 11) % 5) as f64 / 5.0;
+                for _ in 0..presentation_steps {
+                    ts.step(&diagonal_pattern(mag_a), 0.1);
+                }
+                for _ in 0..presentation_steps {
+                    ts.step(&anti_diagonal_pattern(mag_b), 0.1);
+                }
+            }
+
+            // Probe: collect signatures AND total PE energy used during probing.
+            let test_mags = [1.85, 1.95, 2.05, 2.15];
+            let mut total_pe = 0usize;
+            let mut measure = |pattern: &[f64]| -> Vec<f64> {
+                let n_up = ts.upper.units.len();
+                let mut sig = vec![0.0; n_up];
+                for _ in 0..500 {
+                    let out = ts.step(pattern, 0.1);
+                    total_pe += out.pe_total();
+                    for i in 0..n_up {
+                        sig[i] += out.upper_pe_plus[i] as f64 - out.upper_pe_minus[i] as f64;
+                    }
+                }
+                sig
+            };
+            let class_a: Vec<Vec<f64>> = test_mags.iter().map(|&m| measure(&diagonal_pattern(m))).collect();
+            let class_b: Vec<Vec<f64>> = test_mags.iter().map(|&m| measure(&anti_diagonal_pattern(m))).collect();
+            let sep = separability(&class_a, &class_b).map(|s| s.index).unwrap_or(0.0);
+            (sep, total_pe)
+        };
+
+        let (sep_on, pe_on) = train_and_probe(true);
+        let (sep_off, pe_off) = train_and_probe(false);
+
+        // Both must achieve clear separability.
+        assert!(sep_on > 2.0, "coupling-on must remain separable, got {}", sep_on);
+        assert!(sep_off > 2.0, "coupling-off must remain separable, got {}", sep_off);
+
+        // Coupling must reduce PE energy used during probing.
+        assert!(
+            pe_on < pe_off,
+            "coupling should reduce PE energy: on={}, off={} (sep_on={}, sep_off={})",
+            pe_on,
+            pe_off,
+            sep_on,
+            sep_off,
+        );
     }
 }
