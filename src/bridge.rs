@@ -223,4 +223,62 @@ mod tests {
             lower_right,
         );
     }
+
+    /// Position-invariance via spatial pooling: patches at multiple positions
+    /// within the same image quadrant produce cortex top-stage signatures
+    /// that cluster together, well separated from signatures of patches in
+    /// the opposite quadrant. This is the within-receptive-field invariance
+    /// the pooling architecture provides — not learned invariance, but the
+    /// architectural baseline that learned invariance would build on.
+    #[test]
+    fn within_quadrant_position_invariance() {
+        use crate::metrics::separability;
+
+        fn top_signature_for_patch(patch_origin: (usize, usize)) -> Vec<f64> {
+            let img_w = 32;
+            let img_h = 32;
+            let cells = 8;
+            let mut retina = Retina::for_image(img_w, img_h)
+                .resolution(cells, cells)
+                .on_cells_only()
+                .no_eccentricity()
+                .seed(42);
+            let mut img = vec![0.0; img_w * img_h];
+            for dy in 0..5 {
+                for dx in 0..5 {
+                    let x = patch_origin.0 + dx;
+                    let y = patch_origin.1 + dy;
+                    if x < img_w && y < img_h {
+                        img[y * img_w + x] = 1.0;
+                    }
+                }
+            }
+            let output = retina.simulate(&img, 0.3);
+            let bridge = RetinaBridge::from_retina_output(&output, cells, cells, 0.1, 5.0);
+            let s = bridge.mean_rates(1.0 / 30.0);
+
+            let mut cortex = MultiStage::with_defaults(&[(8, 8), (4, 4), (2, 2)], &[2, 2]);
+            for _ in 0..20_000 {
+                cortex.step(&s, 0.1);
+            }
+            cortex.stages[2].predictions()
+        }
+
+        // Class UL: patches at varied positions within the upper-left quadrant.
+        // Class LR: same for lower-right.
+        let ul_origins = [(2, 2), (4, 4), (6, 6), (3, 7), (7, 3)];
+        let lr_origins = [(18, 18), (20, 20), (22, 22), (19, 23), (23, 19)];
+
+        let class_ul: Vec<Vec<f64>> = ul_origins.iter().map(|&p| top_signature_for_patch(p)).collect();
+        let class_lr: Vec<Vec<f64>> = lr_origins.iter().map(|&p| top_signature_for_patch(p)).collect();
+
+        let sep = separability(&class_ul, &class_lr).expect("separability");
+        assert!(
+            sep.index > 1.0,
+            "expected position-invariant class separability > 1, got {} (radius {}, centroid dist {})",
+            sep.index,
+            sep.mean_radius,
+            sep.centroid_distance,
+        );
+    }
 }
