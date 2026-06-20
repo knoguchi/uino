@@ -10,7 +10,7 @@ pub mod cortex;
 pub mod metrics;
 pub mod microcircuit;
 
-pub use bridge::RetinaBridge;
+pub use bridge::{Channel, RetinaBridge};
 
 pub use cortex::{
     A1Core, Belt, CorticalConfig, CorticalModel, CorticalModelBuilder, CorticalOutput,

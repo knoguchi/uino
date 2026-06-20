@@ -409,6 +409,77 @@ mod tests {
         }
     }
 
+    /// Negative test from the design plan: with excessive pooling (one big
+    /// jump from 8×8 → 1×1 instead of the staged 8 → 4 → 2), the top stage
+    /// collapses to a single cell that cannot spatially discriminate.
+    /// Class signatures from opposite quadrants should fail to separate.
+    #[test]
+    fn over_pooling_collapses_discrimination() {
+        // Two-class spatial task: hot upper-left vs hot lower-right.
+        fn ul_pattern(mag: f64) -> Vec<f64> {
+            let mut v = vec![0.0; 64];
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    v[dy * 8 + dx] = mag;
+                }
+            }
+            v
+        }
+        fn lr_pattern(mag: f64) -> Vec<f64> {
+            let mut v = vec![0.0; 64];
+            for dy in 5..8 {
+                for dx in 5..8 {
+                    v[dy * 8 + dx] = mag;
+                }
+            }
+            v
+        }
+
+        fn train_and_measure(shapes: &[(usize, usize)], pools: &[usize]) -> f64 {
+            let mut ms = MultiStage::with_defaults(shapes, pools);
+            let presentation_steps = 200;
+            for cycle in 0..40 {
+                let mag_a = 1.8 + 0.4 * ((cycle * 7) % 5) as f64 / 5.0;
+                let mag_b = 1.8 + 0.4 * ((cycle * 11) % 5) as f64 / 5.0;
+                for _ in 0..presentation_steps {
+                    ms.step(&ul_pattern(mag_a), 0.1);
+                }
+                for _ in 0..presentation_steps {
+                    ms.step(&lr_pattern(mag_b), 0.1);
+                }
+            }
+
+            let test_mags = [1.85, 1.95, 2.05, 2.15];
+            let top = ms.stages.len() - 1;
+            let n_up = ms.stages[top].units.len();
+            let mut measure = |pattern: &[f64]| -> Vec<f64> {
+                let mut sig = vec![0.0; n_up];
+                for _ in 0..500 {
+                    let out = ms.step(pattern, 0.1);
+                    for i in 0..n_up {
+                        sig[i] += out.pe_plus[top][i] as f64 - out.pe_minus[top][i] as f64;
+                    }
+                }
+                sig
+            };
+            let class_a: Vec<Vec<f64>> = test_mags.iter().map(|&m| measure(&ul_pattern(m))).collect();
+            let class_b: Vec<Vec<f64>> = test_mags.iter().map(|&m| measure(&lr_pattern(m))).collect();
+            separability(&class_a, &class_b).map(|s| s.index).unwrap_or(0.0)
+        }
+
+        // Sensible: 8 → 4 → 2, two pool-2 steps.
+        let sensible = train_and_measure(&[(8, 8), (4, 4), (2, 2)], &[2, 2]);
+        // Over-pooled: 8 → 1, single pool-8 step. Top stage is one cell.
+        let collapsed = train_and_measure(&[(8, 8), (1, 1)], &[8]);
+
+        assert!(
+            sensible > collapsed,
+            "sensible pooling should outperform over-pool: sensible={}, collapsed={}",
+            sensible,
+            collapsed,
+        );
+    }
+
     /// PE total at the BOTTOM stage of a 3-stack should fall with learning,
     /// driven by the cascade of predictions descending from the top.
     #[test]

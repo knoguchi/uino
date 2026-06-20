@@ -10,74 +10,113 @@
 //!   counts with exponential decay). The right view for dynamic input
 //!   (video, streaming).
 //!
-//! Output shape matches the retinula grid (cells_x × cells_y) row-major,
-//! ON-channel only for v0.
+//! Output shape matches the retinula grid (cells_x × cells_y) row-major.
+//! [`Channel`] selects which retina population the bridge bins from: ON
+//! cells only, OFF cells only, or both concatenated (ON cells first, then
+//! OFF cells — doubles the input dimension).
 
 use retinula::RetinaOutput;
+
+/// Which retina population(s) the bridge exposes to the cortex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    /// ON cells only. Output length = cells_x * cells_y.
+    On,
+    /// OFF cells only. Output length = cells_x * cells_y.
+    Off,
+    /// Both: ON cells first, then OFF cells, concatenated.
+    /// Output length = 2 * cells_x * cells_y.
+    OnOff,
+}
 
 /// Cortex-aligned view of retinula output.
 pub struct RetinaBridge {
     cells_x: usize,
     cells_y: usize,
-    /// Per-cell firing rate over the whole presentation (Hz).
+    channel: Channel,
+    /// Per-cell firing rate over the whole presentation (Hz). Length matches `channel`.
     mean_rates_hz: Vec<f64>,
-    /// `on_smoothed[step][cell]` = exponentially-smoothed spike trace at
-    /// cortex step `step`. Use for dynamic/streaming input.
-    on_smoothed: Vec<Vec<f64>>,
-    /// Raw spike count per (step, cell).
-    on_counts: Vec<Vec<usize>>,
+    /// `smoothed[step][cell]` = exponentially-smoothed spike trace. Length matches `channel`.
+    smoothed: Vec<Vec<f64>>,
+    /// Raw spike counts. Same shape as `smoothed`.
+    counts: Vec<Vec<usize>>,
     dt_s: f64,
 }
 
 impl RetinaBridge {
     /// `dt_ms`: cortex timestep. `tau_ms`: smoothing time constant
-    /// (5 ms ≈ AMPA EPSC).
+    /// (5 ms ≈ AMPA EPSC). `channel`: which retina population(s) to expose.
     pub fn from_retina_output(
         output: &RetinaOutput,
         cells_x: usize,
         cells_y: usize,
         dt_ms: f64,
         tau_ms: f64,
+        channel: Channel,
     ) -> Self {
         assert!(dt_ms > 0.0 && tau_ms > 0.0);
-        assert_eq!(
-            output.on_cells.len(),
-            cells_x * cells_y,
-            "retina output cell count ({}) doesn't match grid {}×{}",
-            output.on_cells.len(),
-            cells_x,
-            cells_y,
-        );
+        let n_grid = cells_x * cells_y;
+        match channel {
+            Channel::On => assert_eq!(output.on_cells.len(), n_grid),
+            Channel::Off => assert_eq!(output.off_cells.len(), n_grid),
+            Channel::OnOff => {
+                assert_eq!(output.on_cells.len(), n_grid);
+                assert_eq!(output.off_cells.len(), n_grid);
+            }
+        }
         let dt_s = dt_ms * 1e-3;
         let n_steps = (output.duration / dt_s).floor() as usize;
-        let n_cells = cells_x * cells_y;
+        let out_len = match channel {
+            Channel::On | Channel::Off => n_grid,
+            Channel::OnOff => 2 * n_grid,
+        };
 
-        let mut on_counts: Vec<Vec<usize>> = (0..n_steps).map(|_| vec![0usize; n_cells]).collect();
-        for (cell_idx, cell) in output.on_cells.iter().enumerate() {
-            for &t in &cell.spike_times {
-                if t < 0.0 || t >= output.duration {
-                    continue;
+        let mut counts: Vec<Vec<usize>> = (0..n_steps).map(|_| vec![0usize; out_len]).collect();
+
+        let bin_into = |target: &mut [Vec<usize>], cells: &[retinula::CellOutput], offset: usize| {
+            for (cell_idx, cell) in cells.iter().enumerate() {
+                for &t in &cell.spike_times {
+                    if t < 0.0 || t >= output.duration {
+                        continue;
+                    }
+                    let step = (t / dt_s).floor() as usize;
+                    if step < target.len() {
+                        target[step][offset + cell_idx] += 1;
+                    }
                 }
-                let step = (t / dt_s).floor() as usize;
-                if step < n_steps {
-                    on_counts[step][cell_idx] += 1;
-                }
+            }
+        };
+        match channel {
+            Channel::On => bin_into(&mut counts, &output.on_cells, 0),
+            Channel::Off => bin_into(&mut counts, &output.off_cells, 0),
+            Channel::OnOff => {
+                bin_into(&mut counts, &output.on_cells, 0);
+                bin_into(&mut counts, &output.off_cells, n_grid);
             }
         }
 
         let alpha = (-dt_ms / tau_ms).exp();
-        let mut trace = vec![0.0f64; n_cells];
-        let mut on_smoothed: Vec<Vec<f64>> = Vec::with_capacity(n_steps);
+        let mut trace = vec![0.0f64; out_len];
+        let mut smoothed: Vec<Vec<f64>> = Vec::with_capacity(n_steps);
         for step in 0..n_steps {
-            for c in 0..n_cells {
-                trace[c] = alpha * trace[c] + on_counts[step][c] as f64;
+            for c in 0..out_len {
+                trace[c] = alpha * trace[c] + counts[step][c] as f64;
             }
-            on_smoothed.push(trace.clone());
+            smoothed.push(trace.clone());
         }
 
-        let mean_rates_hz: Vec<f64> = output.on_cells.iter().map(|c| c.firing_rate).collect();
+        let mean_rates_hz: Vec<f64> = match channel {
+            Channel::On => output.on_cells.iter().map(|c| c.firing_rate).collect(),
+            Channel::Off => output.off_cells.iter().map(|c| c.firing_rate).collect(),
+            Channel::OnOff => output
+                .on_cells
+                .iter()
+                .map(|c| c.firing_rate)
+                .chain(output.off_cells.iter().map(|c| c.firing_rate))
+                .collect(),
+        };
 
-        Self { cells_x, cells_y, mean_rates_hz, on_smoothed, on_counts, dt_s }
+        Self { cells_x, cells_y, channel, mean_rates_hz, smoothed, counts, dt_s }
     }
 
     pub fn cells_x(&self) -> usize {
@@ -86,8 +125,16 @@ impl RetinaBridge {
     pub fn cells_y(&self) -> usize {
         self.cells_y
     }
+    pub fn channel(&self) -> Channel {
+        self.channel
+    }
+    /// Length of each per-step input vector (`cells_x*cells_y` for single
+    /// channel, doubled for `OnOff`).
+    pub fn input_len(&self) -> usize {
+        self.smoothed.first().map(|v| v.len()).unwrap_or(0)
+    }
     pub fn n_steps(&self) -> usize {
-        self.on_smoothed.len()
+        self.smoothed.len()
     }
     pub fn dt_s(&self) -> f64 {
         self.dt_s
@@ -100,12 +147,12 @@ impl RetinaBridge {
     }
 
     pub fn counts_at(&self, step: usize) -> &[usize] {
-        &self.on_counts[step]
+        &self.counts[step]
     }
 
     /// Per-step smoothed rate trace, scaled. Right form for dynamic input.
     pub fn rates_at(&self, step: usize, scale: f64) -> Vec<f64> {
-        self.on_smoothed[step].iter().map(|&r| r * scale).collect()
+        self.smoothed[step].iter().map(|&r| r * scale).collect()
     }
 }
 
@@ -139,7 +186,7 @@ mod tests {
         let output = retina.simulate(&img, 0.5);
         assert!(output.total_spikes() > 100);
 
-        let bridge = RetinaBridge::from_retina_output(&output, cells, cells, 0.1, 5.0);
+        let bridge = RetinaBridge::from_retina_output(&output, cells, cells, 0.1, 5.0, Channel::On);
 
         // Use mean-rates (per-cell Hz averaged over the presentation) as a
         // constant cortex input. Scale so cell firing rates land in the
@@ -191,7 +238,7 @@ mod tests {
                 }
             }
             let output = retina.simulate(&img, 0.5);
-            let bridge = RetinaBridge::from_retina_output(&output, cells, cells, 0.1, 5.0);
+            let bridge = RetinaBridge::from_retina_output(&output, cells, cells, 0.1, 5.0, Channel::On);
             let s = bridge.mean_rates(1.0 / 30.0);
 
             let mut cortex = MultiStage::with_defaults(&[(8, 8), (4, 4), (2, 2)], &[2, 2]);
@@ -221,6 +268,67 @@ mod tests {
             lr_asym,
             upper_left,
             lower_right,
+        );
+    }
+
+    /// ON+OFF channel produces an input vector of length 2*cells*cells.
+    /// A bright patch on a dark background drives ON cells preferentially;
+    /// a dark patch on a bright background drives OFF cells. The bridge
+    /// must route these to distinct halves of the output vector.
+    #[test]
+    fn on_off_channel_carries_polarity_information() {
+        let img_w = 16;
+        let img_h = 16;
+        let cells = 4;
+        let mut retina = Retina::for_image(img_w, img_h)
+            .resolution(cells, cells)
+            .no_eccentricity()
+            .seed(42);
+
+        // Both images sit on a gray background; only the central patch's
+        // polarity differs. Same overall luminance — isolates the local
+        // contrast effect that ON/OFF cells are designed to detect.
+        let gray = 0.5;
+        let mut bright_on_gray = vec![gray; img_w * img_h];
+        let mut dark_on_gray = vec![gray; img_w * img_h];
+        for dy in 4..9 {
+            for dx in 4..9 {
+                bright_on_gray[dy * img_w + dx] = 1.0;
+                dark_on_gray[dy * img_w + dx] = 0.0;
+            }
+        }
+
+        let out_bright = retina.simulate(&bright_on_gray, 0.2);
+        let bridge_bright = RetinaBridge::from_retina_output(
+            &out_bright, cells, cells, 0.1, 5.0, Channel::OnOff,
+        );
+        assert_eq!(bridge_bright.input_len(), 2 * cells * cells);
+        let rates_bright = bridge_bright.mean_rates(1.0);
+        let on_sum_bright: f64 = rates_bright[..cells * cells].iter().sum();
+        let off_sum_bright: f64 = rates_bright[cells * cells..].iter().sum();
+
+        retina.reset();
+        let out_dark = retina.simulate(&dark_on_gray, 0.2);
+        let bridge_dark = RetinaBridge::from_retina_output(
+            &out_dark, cells, cells, 0.1, 5.0, Channel::OnOff,
+        );
+        let rates_dark = bridge_dark.mean_rates(1.0);
+        let on_sum_dark: f64 = rates_dark[..cells * cells].iter().sum();
+        let off_sum_dark: f64 = rates_dark[cells * cells..].iter().sum();
+
+        // Bright-on-dark should drive ON cells MORE than dark-on-bright does;
+        // dark-on-bright should drive OFF cells MORE than bright-on-dark.
+        assert!(
+            on_sum_bright > on_sum_dark,
+            "ON should respond more to bright patch: bright={}, dark={}",
+            on_sum_bright,
+            on_sum_dark
+        );
+        assert!(
+            off_sum_dark > off_sum_bright,
+            "OFF should respond more to dark patch: bright={}, dark={}",
+            off_sum_bright,
+            off_sum_dark
         );
     }
 
@@ -254,7 +362,7 @@ mod tests {
                 }
             }
             let output = retina.simulate(&img, 0.3);
-            let bridge = RetinaBridge::from_retina_output(&output, cells, cells, 0.1, 5.0);
+            let bridge = RetinaBridge::from_retina_output(&output, cells, cells, 0.1, 5.0, Channel::On);
             let s = bridge.mean_rates(1.0 / 30.0);
 
             let mut cortex = MultiStage::with_defaults(&[(8, 8), (4, 4), (2, 2)], &[2, 2]);
