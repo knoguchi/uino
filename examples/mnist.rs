@@ -205,15 +205,16 @@ fn main() -> Result<(), String> {
     println!();
 
     let mut retina = make_retina(); // reset
-    let mut cortex = MultiStage::with_defaults(&[(CELLS, CELLS), (CELLS / 2, CELLS / 2), (CELLS / 4, CELLS / 4)], &[2, 2]);
+
+    // Shallower architecture: 16→8 only. Top stage has 64 cells — much
+    // higher dimensional than the 16-cell deep stack, so it can carry
+    // more class-discriminative information.
+    let mut cortex = MultiStage::with_defaults(&[(CELLS, CELLS), (CELLS / 2, CELLS / 2)], &[2]);
     cortex.enable_plasticity();
+    cortex.enable_input_rf(3, CELLS, CELLS);
     let n_top = cortex.stages[cortex.stages.len() - 1].units.len();
 
-    // Each epoch: walk through training images once, accumulating per-class
-    // centroids from the cortex's top-stage signatures. The cortex's plastic
-    // weights consolidate the more often each pattern is presented. After
-    // the epoch, classify the held-out test set with nearest-centroid.
-    println!("Architecture: retinula({c}×{c}) → cortex {c}→{m}→{t}", c = CELLS, m = CELLS / 2, t = CELLS / 4);
+    println!("Architecture: retinula({c}×{c}) → cortex {c}→{m} (3×3 plastic input RFs, top={t})", c = CELLS, m = CELLS / 2, t = n_top);
     println!("{} training images, {} test images, {} classes", train_imgs.len(), test_imgs.len(), N_CLASSES);
     println!("Chance accuracy = {:.1}%\n", 100.0 / N_CLASSES as f64);
 
@@ -221,7 +222,6 @@ fn main() -> Result<(), String> {
     let mut counts: Vec<usize> = vec![0; N_CLASSES];
 
     for epoch in 1..=EPOCHS {
-        // Train: present each image, accumulate centroid.
         for i in 0..train_imgs.len() {
             let sig = signature_for(&train_imgs[i], &mut retina, &mut cortex);
             let label = train_labels[i] as usize;
@@ -230,7 +230,6 @@ fn main() -> Result<(), String> {
             }
             counts[label] += 1;
         }
-        // Average centroids (running mean).
         let mut snapshot = vec![vec![0.0; n_top]; N_CLASSES];
         for c in 0..N_CLASSES {
             if counts[c] > 0 {
@@ -239,12 +238,10 @@ fn main() -> Result<(), String> {
                 }
             }
         }
-        // Evaluate.
         let acc = evaluate(&mut cortex, &mut retina, &snapshot, test_imgs, test_labels);
         println!("epoch {}/{}: test accuracy = {:.1}%", epoch, EPOCHS, 100.0 * acc);
     }
 
-    // Persist the trained cortex.
     cortex.save_to_file("mnist_cortex.bin").map_err(|e| e.to_string())?;
     println!("\nSaved trained cortex to mnist_cortex.bin");
     Ok(())

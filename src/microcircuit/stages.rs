@@ -81,6 +81,33 @@ pub struct MultiStage {
     /// default so existing tests with synthetic patterns run with stable
     /// uniform routing. Enable to learn pattern-selective connections.
     pub plasticity_enabled: bool,
+
+    /// Bottom-stage input receptive-field configuration. When set, each
+    /// bottom-stage cell at grid position (x, y) integrates input values
+    /// in a `rf_size × rf_size` window centered on (x, y) with learnable
+    /// per-connection weights. Random initial weights + rate-based
+    /// Hebbian learning produce V1-simple-cell-like input filters.
+    ///
+    /// Layout: `input_weights[cell_idx][rf_offset]` is the weight from
+    /// `input[idx_for_rf(cell_idx, rf_offset)]` into that cell's `s`.
+    /// `None` falls back to direct 1:1 input mapping (legacy behavior).
+    pub input_rf: Option<InputRf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InputRf {
+    pub rf_size: usize,
+    pub input_width: usize,
+    pub input_height: usize,
+    /// Plastic weights, one Vec per bottom-stage cell (length = rf_size^2).
+    pub weights: Vec<Vec<f64>>,
+    /// Rate-based Hebbian learning rate (per step).
+    pub lr: f64,
+    /// L1 decay per step.
+    pub decay: f64,
+    /// Weight bounds.
+    pub w_min: f64,
+    pub w_max: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -146,6 +173,7 @@ impl MultiStage {
             fb_gain: 1.0,
             ff_weights,
             plasticity_enabled: false,
+            input_rf: None,
         }
     }
 
@@ -155,6 +183,125 @@ impl MultiStage {
 
     pub fn disable_plasticity(&mut self) {
         self.plasticity_enabled = false;
+    }
+
+    /// Attach a plastic spatial receptive field to the bottom stage. After
+    /// this, each bottom-stage cell at grid position (x, y) integrates a
+    /// `rf_size × rf_size` window of the input around (x, y), with
+    /// per-connection learnable weights. `input_width`/`input_height` must
+    /// match the input shape passed to `step`.
+    ///
+    /// Initial weights are quasi-random in `[w_min, w_max/4]` so the cells
+    /// start non-uniform — Hebbian learning then differentiates them per
+    /// the inputs they actually see.
+    pub fn enable_input_rf(&mut self, rf_size: usize, input_width: usize, input_height: usize) {
+        assert!(rf_size > 0);
+        let cells = self.stages[0].cells_x * self.stages[0].cells_y;
+        let n_rf = rf_size * rf_size;
+        let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as f64 / u64::MAX as f64).clamp(0.0, 1.0)
+        };
+        let weights: Vec<Vec<f64>> = (0..cells)
+            .map(|_| (0..n_rf).map(|_| 0.25 + 0.5 * rng()).collect())
+            .collect();
+        self.input_rf = Some(InputRf {
+            rf_size,
+            input_width,
+            input_height,
+            weights,
+            lr: 5e-5,
+            decay: 1e-5,
+            w_min: 0.0,
+            w_max: 2.0,
+        });
+    }
+
+    /// Compute the bottom-stage cell input vector given the external input
+    /// vector. If `input_rf` is set, applies the plastic spatial RF; else
+    /// returns input as-is.
+    fn project_input(&self, input: &[f64]) -> Vec<f64> {
+        let n_cells = self.stages[0].units.len();
+        match &self.input_rf {
+            None => input.to_vec(),
+            Some(rf) => {
+                let cells_x = self.stages[0].cells_x;
+                let cells_y = self.stages[0].cells_y;
+                let w_in = rf.input_width;
+                let h_in = rf.input_height;
+                let half = (rf.rf_size / 2) as i32;
+                let mut out = vec![0.0; n_cells];
+                // Cell grid maps onto input via uniform scaling (input pixel
+                // = cell index, since shapes match in our pipeline).
+                for cy in 0..cells_y {
+                    for cx in 0..cells_x {
+                        let cell_idx = cy * cells_x + cx;
+                        let mut acc = 0.0;
+                        let mut k = 0;
+                        for dy in -half..=half {
+                            for dx in -half..=half {
+                                let ix = cx as i32 + dx;
+                                let iy = cy as i32 + dy;
+                                let val = if ix >= 0 && (ix as usize) < w_in && iy >= 0 && (iy as usize) < h_in {
+                                    input[iy as usize * w_in + ix as usize]
+                                } else {
+                                    0.0
+                                };
+                                acc += val * rf.weights[cell_idx][k];
+                                k += 1;
+                            }
+                        }
+                        out[cell_idx] = acc / (rf.rf_size * rf.rf_size) as f64;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Rate-based Hebbian update on the input RF weights, applied per step.
+    /// `input` is the raw input (pre-RF). `pe_plus_bottom` is the PE+ count
+    /// per bottom-stage cell this step.
+    fn update_input_rf(&mut self, input: &[f64], pe_plus_bottom: &[usize]) {
+        let cells_x = self.stages[0].cells_x;
+        let cells_y = self.stages[0].cells_y;
+        if let Some(rf) = &mut self.input_rf {
+            let w_in = rf.input_width;
+            let h_in = rf.input_height;
+            let half = (rf.rf_size / 2) as i32;
+            for cy in 0..cells_y {
+                for cx in 0..cells_x {
+                    let cell_idx = cy * cells_x + cx;
+                    let post = pe_plus_bottom[cell_idx] as f64;
+                    if post == 0.0 {
+                        // Only decay if no firing — saves work.
+                        for w in &mut rf.weights[cell_idx] {
+                            *w = (*w - rf.decay).max(rf.w_min).min(rf.w_max);
+                        }
+                        continue;
+                    }
+                    let mut k = 0;
+                    for dy in -half..=half {
+                        for dx in -half..=half {
+                            let ix = cx as i32 + dx;
+                            let iy = cy as i32 + dy;
+                            let pre = if ix >= 0 && (ix as usize) < w_in && iy >= 0 && (iy as usize) < h_in {
+                                input[iy as usize * w_in + ix as usize]
+                            } else {
+                                0.0
+                            };
+                            let dw = rf.lr * pre * post - rf.decay;
+                            rf.weights[cell_idx][k] =
+                                (rf.weights[cell_idx][k] + dw).max(rf.w_min).min(rf.w_max);
+                            k += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Serialize the entire model state (weights + per-cell state) to a
@@ -218,7 +365,12 @@ impl MultiStage {
 
     pub fn step(&mut self, input: &[f64], dt_ms: f64) -> MultiStageStepOutput {
         let n_stages = self.stages.len();
-        assert_eq!(input.len(), self.stages[0].units.len(), "input shape mismatch");
+        // With input_rf, `input` is the raw image-grid and we project it
+        // through learned RFs into the bottom-stage scalar inputs.
+        // Without input_rf, input must already match the bottom-stage shape.
+        if self.input_rf.is_none() {
+            assert_eq!(input.len(), self.stages[0].units.len(), "input shape mismatch");
+        }
 
         // Pre-fetch all μ̂ vectors so feedback uses the state at start-of-step.
         let mu_per_stage: Vec<Vec<f64>> = self.stages.iter().map(|s| s.predictions()).collect();
@@ -227,7 +379,7 @@ impl MultiStage {
         let mut pe_minus: Vec<Vec<usize>> = vec![Vec::new(); n_stages];
 
         // Walk bottom to top.
-        let mut current_input: Vec<f64> = input.to_vec();
+        let mut current_input: Vec<f64> = self.project_input(input);
         for i in 0..n_stages {
             let n_cells = self.stages[i].units.len();
             let top_down: Vec<f64> = if i + 1 < n_stages {
@@ -291,6 +443,12 @@ impl MultiStage {
                 for w in stage_weights {
                     w.step(dt_ms);
                 }
+            }
+
+            // Input RF plasticity (bottom stage only).
+            if self.input_rf.is_some() {
+                let pp0 = pe_plus[0].clone();
+                self.update_input_rf(input, &pp0);
             }
         }
 
