@@ -1,11 +1,4 @@
 /target
 .DS_Store
-__pycache__/
-*.pyc
-*.npz
-*.pt
-*.bin
-*.mp3
-*.wav
-*.zip
-*.pdf
+/mnist
+/mnist_cortex.bin
