@@ -130,6 +130,15 @@ impl MultiStage {
         }
     }
 
+    /// Set the prediction integration rate `eta` for every cell in one stage.
+    /// Lets a stack carry a timescale gradient (fast lower → slow upper) so
+    /// different stages select different input frequencies.
+    pub fn set_stage_eta(&mut self, stage_idx: usize, eta: f64) {
+        for u in &mut self.stages[stage_idx].units {
+            u.params.eta = eta;
+        }
+    }
+
     /// Parent cell index in stage[i+1] for a child cell at index `child_i` in stage[i].
     fn parent_idx(&self, lower_stage: usize, child_i: usize) -> usize {
         let pool = self.pools[lower_stage];
@@ -477,6 +486,107 @@ mod tests {
             "sensible pooling should outperform over-pool: sensible={}, collapsed={}",
             sensible,
             collapsed,
+        );
+    }
+
+    /// Deterministic per-step pseudo-random noise (no rand dep needed).
+    fn noise_sample(state: &mut u64) -> f64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state as f64 / u64::MAX as f64) * 2.0 - 1.0
+    }
+
+    fn class_a_pattern(mag: f64) -> Vec<f64> {
+        // Vertical stripe down the left third.
+        let mut v = vec![0.0; 64];
+        for y in 0..8 {
+            for x in 0..2 {
+                v[y * 8 + x] = mag;
+            }
+        }
+        v
+    }
+
+    fn class_b_pattern(mag: f64) -> Vec<f64> {
+        // Horizontal stripe across the top third.
+        let mut v = vec![0.0; 64];
+        for y in 0..2 {
+            for x in 0..8 {
+                v[y * 8 + x] = mag;
+            }
+        }
+        v
+    }
+
+    fn jitter(base: &[f64], noise_amp: f64, state: &mut u64) -> Vec<f64> {
+        base.iter().map(|&v| (v + noise_amp * noise_sample(state)).max(0.0)).collect()
+    }
+
+    /// Phase 2b: a timescale gradient through the stack produces noise-
+    /// robust class discrimination at the top. With fast `eta` everywhere
+    /// (flat profile), per-cell fast noise on the input contaminates the
+    /// top-stage representation and reduces class separability. With a
+    /// gradient (fast lower → slow upper), the upper stage filters out
+    /// the noise as a fast component and retains the slow class identity.
+    #[test]
+    fn timescale_gradient_yields_noise_robust_class_separation() {
+        fn train_and_measure(stage_etas: &[f64]) -> f64 {
+            let mut ms = MultiStage::with_defaults(&[(8, 8), (4, 4), (2, 2)], &[2, 2]);
+            for (i, &e) in stage_etas.iter().enumerate() {
+                ms.set_stage_eta(i, e);
+            }
+            let mut state: u64 = 0x9E3779B97F4A7C15;
+
+            let presentation_steps = 300;
+            for cycle in 0..40 {
+                let mag_a = 1.8 + 0.4 * ((cycle * 7) % 5) as f64 / 5.0;
+                let mag_b = 1.8 + 0.4 * ((cycle * 11) % 5) as f64 / 5.0;
+                let base_a = class_a_pattern(mag_a);
+                let base_b = class_b_pattern(mag_b);
+                for _ in 0..presentation_steps {
+                    let s = jitter(&base_a, 0.8, &mut state);
+                    ms.step(&s, 0.1);
+                }
+                for _ in 0..presentation_steps {
+                    let s = jitter(&base_b, 0.8, &mut state);
+                    ms.step(&s, 0.1);
+                }
+            }
+
+            let test_mags = [1.85, 1.95, 2.05, 2.15];
+            let top = ms.stages.len() - 1;
+            let n_up = ms.stages[top].units.len();
+            let mut measure_for = |base: Vec<f64>| -> Vec<f64> {
+                let mut sig = vec![0.0; n_up];
+                for _ in 0..1000 {
+                    let s = jitter(&base, 0.8, &mut state);
+                    let out = ms.step(&s, 0.1);
+                    for i in 0..n_up {
+                        sig[i] += out.pe_plus[top][i] as f64 - out.pe_minus[top][i] as f64;
+                    }
+                }
+                sig
+            };
+            let class_a: Vec<Vec<f64>> =
+                test_mags.iter().map(|&m| measure_for(class_a_pattern(m))).collect();
+            let class_b: Vec<Vec<f64>> =
+                test_mags.iter().map(|&m| measure_for(class_b_pattern(m))).collect();
+            separability(&class_a, &class_b).map(|s| s.index).unwrap_or(0.0)
+        }
+
+        // Flat profile: same fast eta everywhere — no timescale gradient.
+        let flat = train_and_measure(&[0.0005, 0.0005, 0.0005]);
+        // Gradient: lower stages track fast input incl. noise; upper stage
+        // has much smaller eta, so its prediction filters out the fast noise
+        // and retains the slow class identity.
+        let gradient = train_and_measure(&[0.0005, 0.0001, 0.00003]);
+
+        assert!(
+            gradient > flat,
+            "timescale gradient should outperform flat profile: gradient={}, flat={}",
+            gradient,
+            flat,
         );
     }
 
