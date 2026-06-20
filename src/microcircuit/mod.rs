@@ -16,7 +16,7 @@ pub use adex::{AdEx, AdExParams};
 pub use apparent_motion::{alternating_stimulus, ApparentMotion, TwoUnitOutput};
 pub use canonical::{Microcircuit, MicrocircuitParams, StepOutput};
 pub use plasticity::{HebbianCa, HebbianParams};
-pub use stages::{StageGrid, TwoStage, TwoStageStepOutput};
+pub use stages::{MultiStage, MultiStageStepOutput, StageGrid};
 pub use synapse::{AmpaSynapse, NmdaSynapse, SynapseParams};
 
 #[cfg(test)]
