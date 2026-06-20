@@ -6,6 +6,7 @@
 //! visual input.
 
 pub mod cortex;
+pub mod metrics;
 pub mod microcircuit;
 
 pub use cortex::{
