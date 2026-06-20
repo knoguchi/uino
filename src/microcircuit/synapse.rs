@@ -60,12 +60,15 @@ impl AmpaSynapse {
         self.g *= decay;
     }
 
-    /// Synaptic current given postsynaptic voltage (pA).
+    /// Inward synaptic current given postsynaptic voltage (pA).
     ///
-    /// I = g * (V - E_rev), with g in nS, V in mV → current in pA.
+    /// Returns the current flowing INTO the cell, with the same sign convention
+    /// as [`AdEx::step`]'s `i_input`: positive when depolarizing. Specifically,
+    /// `I_in = g * (E_rev - V)` — positive when V < E_rev (typical for resting
+    /// glutamatergic synapses).
     #[inline]
     pub fn current(&self, v_post: f64) -> f64 {
-        self.g * (v_post - self.params.e_rev)
+        self.g * (self.params.e_rev - v_post)
     }
 
     pub fn reset(&mut self) {
@@ -119,10 +122,11 @@ impl NmdaSynapse {
         1.0 / (1.0 + self.mg_conc * (-0.062 * v_post).exp() / 3.57)
     }
 
-    /// NMDA current including Mg²⁺ block (pA).
+    /// Inward NMDA current including Mg²⁺ block (pA).
+    /// Sign convention matches [`AdEx::step`]'s `i_input`: positive depolarizes.
     #[inline]
     pub fn current(&self, v_post: f64) -> f64 {
-        self.g * (v_post - self.params.e_rev) * self.mg_block(v_post)
+        self.g * (self.params.e_rev - v_post) * self.mg_block(v_post)
     }
 
     pub fn reset(&mut self) {
